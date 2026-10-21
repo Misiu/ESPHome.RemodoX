@@ -1,0 +1,137 @@
+# Same as example.yaml plus everything needed to diagnose reconnect / sleep problems.
+# Watch the log through the ESPHome dashboard (Logs -> Wirelessly) during the test.
+
+substitutions:
+  remodo_mac: "AA:BB:CC:DD:EE:FF"   # BD address of your Remodo X
+
+esphome:
+  name: esphome-remodo
+  friendly_name: Remodo X Proxy
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  logs:
+    remodox: DEBUG          # state machine, keepalive, notifies, keys, [stats] every 60 s
+    ble_client: DEBUG
+    esp32_ble_client: DEBUG # service discovery, CCCD writes
+    esp32_ble_tracker: INFO
+    esp32_ble: INFO
+    wifi: DEBUG             # Wi-Fi drops can kill the BLE link
+    remodo_adv: INFO        # advertisements of the remote (see below)
+
+api:
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+esp32_ble:
+  io_capability: keyboard_display
+
+external_components:
+  - source: github://Misiu/ESPHome.RemodoX@main
+    components: [remodox]
+
+esp32_ble_tracker:
+  # Log what the remote advertises (a sleeping remote advertises "Find_Remodo_X_..."
+  # and has no HID service; an awake one advertises "Remodo_X_..."). Throttled.
+  on_ble_advertise:
+    - mac_address: ${remodo_mac}
+      then:
+        - lambda: |-
+            static uint32_t last_log = 0;
+            static std::string last_name;
+            uint32_t now = millis();
+            std::string name = x.get_name();
+            if (name != last_name || now - last_log > 10000) {
+              ESP_LOGI("remodo_adv", "advertising: name='%s' rssi=%d services=%u",
+                       name.c_str(), (int) x.get_rssi(), (unsigned) x.get_service_uuids().size());
+              last_name = name;
+              last_log = now;
+            }
+
+ble_client:
+  - id: remodo_ble
+    mac_address: ${remodo_mac}
+    auto_connect: true
+    on_connect:
+      then:
+        - logger.log: "Remodo connected"
+    on_disconnect:
+      then:
+        - logger.log: "Remodo disconnected"
+
+remodox:
+  id: remodo_x
+  ble_client_id: remodo_ble
+
+debug:
+  update_interval: 60s
+
+binary_sensor:
+  - platform: template
+    name: "Remodo connected"
+    lambda: 'return id(remodo_ble)->connected();'
+
+sensor:
+  - platform: remodox
+    type: last_event_value
+    id: remodo_last_value
+    internal: true
+  - platform: debug
+    free:
+      name: "ESP heap free"
+  - platform: wifi_signal
+    name: "ESP WiFi signal"
+    update_interval: 60s
+
+text_sensor:
+  - platform: remodox
+    type: last_event_code
+    id: remodo_last_code
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            // Keyboard keys A..H = usage page 7, ids 4..11 (see README).
+            static const char *const EVENTS[] = {
+                "button_1_press", "button_2_press", "button_3_press", "button_4_press",
+                "button_1_long_press", "button_2_long_press", "button_3_long_press",
+                "button_4_long_press"};
+            if (id(remodo_last_value).state != 1) return;
+            if (x.compare(0, 2, "7_") != 0) return;
+            int usage = atoi(x.c_str() + 2);
+            if (usage >= 4 && usage <= 11) {
+              ESP_LOGI("remodo_event", "-> %s", EVENTS[usage - 4]);
+              id(remodo_buttons).trigger(EVENTS[usage - 4]);
+            }
+  - platform: remodox
+    type: last_event_usage
+    id: remodo_last_usage
+    internal: true
+  - platform: debug
+    reset_reason:
+      name: "ESP reset reason"
+
+event:
+  - platform: template
+    id: remodo_buttons
+    name: "Remodo Buttons"
+    device_class: button
+    event_types:
+      - button_1_press
+      - button_2_press
+      - button_3_press
+      - button_4_press
+      - button_1_long_press
+      - button_2_long_press
+      - button_3_long_press
+      - button_4_long_press

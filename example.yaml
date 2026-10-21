@@ -1,6 +1,9 @@
 # Remodo X -> Home Assistant through an ESP32 (ESPHome 2026.x, esp-idf).
 # Put your Wi-Fi and OTA credentials in secrets.yaml.
 
+substitutions:
+  remodo_mac: "AA:BB:CC:DD:EE:FF"   # BD address of your Remodo X
+
 esphome:
   name: esphome-remodo
   friendly_name: Remodo X Proxy
@@ -32,7 +35,7 @@ esp32_ble_tracker:
 
 ble_client:
   - id: remodo_ble
-    mac_address: "AA:BB:CC:DD:EE:FF"   # the BD address of your Remodo X
+    mac_address: ${remodo_mac}
     auto_connect: true
     on_connect:
       then:

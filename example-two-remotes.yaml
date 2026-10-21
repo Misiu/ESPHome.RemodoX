@@ -1,0 +1,115 @@
+# Two Remodo X remotes on one ESP32 (up to three are supported, see MULTI_CONF).
+# Each remote has its own ble_client, its own remodox and its own event entity.
+# With more than one remodox: the sensors must name their remodox_id.
+
+substitutions:
+  remodo1_mac: "AA:BB:CC:DD:EE:01"   # BD address of remote 1
+  remodo2_mac: "AA:BB:CC:DD:EE:02"   # BD address of remote 2
+
+esphome:
+  name: esphome-remodo
+  friendly_name: Remodo X Proxy
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+api:
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+esp32_ble:
+  io_capability: keyboard_display
+
+external_components:
+  - source: github://Misiu/ESPHome.RemodoX@main
+    components: [remodox]
+
+esp32_ble_tracker:
+
+ble_client:
+  - id: remodo_ble_1
+    mac_address: ${remodo1_mac}
+    auto_connect: true
+  - id: remodo_ble_2
+    mac_address: ${remodo2_mac}
+    auto_connect: true
+
+remodox:
+  - id: remodo_x_1
+    ble_client_id: remodo_ble_1
+  - id: remodo_x_2
+    ble_client_id: remodo_ble_2
+
+sensor:
+  - platform: remodox
+    remodox_id: remodo_x_1
+    type: last_event_value
+    id: remodo_1_value
+    internal: true
+  - platform: remodox
+    remodox_id: remodo_x_2
+    type: last_event_value
+    id: remodo_2_value
+    internal: true
+
+text_sensor:
+  - platform: remodox
+    remodox_id: remodo_x_1
+    type: last_event_code
+    id: remodo_1_code
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            static const char *const EVENTS[] = {
+                "button_1_press", "button_2_press", "button_3_press", "button_4_press",
+                "button_1_long_press", "button_2_long_press", "button_3_long_press",
+                "button_4_long_press"};
+            if (id(remodo_1_value).state != 1) return;
+            if (x.compare(0, 2, "7_") != 0) return;
+            int usage = atoi(x.c_str() + 2);
+            if (usage >= 4 && usage <= 11) id(remodo_1_buttons).trigger(EVENTS[usage - 4]);
+  - platform: remodox
+    remodox_id: remodo_x_2
+    type: last_event_code
+    id: remodo_2_code
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            static const char *const EVENTS[] = {
+                "button_1_press", "button_2_press", "button_3_press", "button_4_press",
+                "button_1_long_press", "button_2_long_press", "button_3_long_press",
+                "button_4_long_press"};
+            if (id(remodo_2_value).state != 1) return;
+            if (x.compare(0, 2, "7_") != 0) return;
+            int usage = atoi(x.c_str() + 2);
+            if (usage >= 4 && usage <= 11) id(remodo_2_buttons).trigger(EVENTS[usage - 4]);
+
+event:
+  - platform: template
+    id: remodo_1_buttons
+    name: "Remodo 1 Buttons"
+    device_class: button
+    event_types: &remodo_events
+      - button_1_press
+      - button_2_press
+      - button_3_press
+      - button_4_press
+      - button_1_long_press
+      - button_2_long_press
+      - button_3_long_press
+      - button_4_long_press
+  - platform: template
+    id: remodo_2_buttons
+    name: "Remodo 2 Buttons"
+    device_class: button
+    event_types: *remodo_events
