@@ -52,7 +52,7 @@ class GATTReadData {
       memcpy(this->value_, value, sizeof(uint8_t) * value_len);
     }
     ~GATTReadData(){
-      delete value_;
+      delete[] value_;
     }
   public:
     uint8_t *value_;
@@ -123,6 +123,19 @@ class RemodoX : public Component, public ble_client::BLEClientNode {
   bool wake_attempted_ = false;
   void find_ias_handle_();
   void write_alert_level_(uint8_t level, const char *why);
+
+  // Diagnostics (all per instance, so several remotes can run side by side).
+  static constexpr uint32_t STATS_INTERVAL_MS = 60000;
+  uint32_t connect_ms_ = 0;       // millis() of the last CONNECT_EVT, 0 = never
+  uint32_t disconnect_ms_ = 0;    // millis() of the last DISCONNECT_EVT, 0 = never
+  uint32_t last_notify_ms_ = 0;   // millis() of the last HID notification
+  uint32_t last_key_ms_ = 0;      // millis() of the last decoded key event
+  uint32_t last_stats_ms_ = 0;
+  uint32_t notify_count_ = 0;     // since the current connection
+  uint32_t key_count_ = 0;        // since the current connection
+  uint32_t keepalive_count_ = 0;  // since the current connection
+  uint32_t connection_count_ = 0; // since boot
+  void log_stats_();
 };
 
 }  // namespace remodox

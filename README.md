@@ -29,7 +29,7 @@ The remote must already send the right keys. The component only receives them, i
 LED: **red** = Setup Mode, **green** = Control Mode.
 
 ## 2. Flash the ESP32
-Copy [`example.yaml`](example.yaml), set the `mac_address` of your remote (the advertised name is `Remodo_X_` followed by the last five hex digits of that address) and flash it. When the remote is in Control Mode and not bonded, the ESP32 connects and pairs with it automatically. The log should show `Remodo connected` and `[configure] keepalive …`.
+Copy [`example.yaml`](example.yaml), set `remodo_mac` in the `substitutions:` block at the top to the address of your remote (its advertised name is `Remodo_X_` followed by the last five hex digits of that address) and flash it. When the remote is in Control Mode and not bonded, the ESP32 connects and pairs with it automatically. The log should show `Remodo connected` and `[configure] keepalive …`.
 
 Minimal configuration:
 ```yaml
@@ -60,6 +60,7 @@ sensor:
 text_sensor:
   - platform: remodox
     type: last_event_code
+    id: remodo_last_code
     internal: true
 ```
 Entities:
@@ -70,7 +71,18 @@ Entities:
 
 `example.yaml` turns the eight keys into one `event` entity (`button_1_press` … `button_4_long_press`) that you can use in Home Assistant automations. `remodox_id` is only needed on `sensor` / `text_sensor` when you use more than one `remodox:`.
 
-## 3. What the component does for Remodo X
+## Two or more remotes
+Up to three remotes can run on one ESP32. Give each its own `ble_client` and its own `remodox:` entry, and name the `remodox_id` on every `sensor` / `text_sensor`. All state is kept per remote, log lines are prefixed with the remote's address, and the `esphome.hid_events` event carries an `address` field. See [`example-two-remotes.yaml`](example-two-remotes.yaml). Every extra connection takes airtime from Wi-Fi, so the link margin is smaller than with one remote.
+
+## Diagnostics
+[`example-debug.yaml`](example-debug.yaml) is `example.yaml` with everything needed to analyse problems: component log levels, a log of the remote's advertisements (`Remodo_X_…` awake, `Find_Remodo_X_…` asleep), connection state, Wi-Fi signal, free heap and the reset reason. The component logs, per remote:
+- every connect and disconnect with the decoded HCI reason, the connection length and the time since the last key,
+- pairing result, connection parameter changes, service list, CCCD (notification) writes,
+- every notification and decoded key, with timing,
+- every keepalive / wake write,
+- a `[stats]` line every 60 s (state, counters, seconds since the last key, free heap).
+
+## What the component does for Remodo X
 Facts from analysing firmware `20211006`:
 - The remote disconnects itself after **5 minutes without activity** (HCI reason `0x13`), resets, and wakes in a sleep mode that has **no HID service** and advertises as `Find_Remodo_X_…`. A host that stays connected to it makes the remote ignore key presses.
 - A short key press is sent when the key is **released**, and only if the host has enabled notifications at that moment. The press that wakes a sleeping remote is therefore usually lost, so the link should stay up.

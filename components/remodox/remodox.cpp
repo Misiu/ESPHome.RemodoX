@@ -2,6 +2,8 @@
 
 #include "usages.h"
 
+#include "esp_system.h"
+
 #ifdef USE_ESP32
 
 namespace esphome {
@@ -9,9 +11,35 @@ namespace remodox {
 
 static const char *const TAG = "remodox";
 
+// Every line carries the remote's address so that several remotes can be told apart.
+#define LOGD(fmt, ...) ESP_LOGD(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
+#define LOGI(fmt, ...) ESP_LOGI(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
+#define LOGW(fmt, ...) ESP_LOGW(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
+#define LOGE(fmt, ...) ESP_LOGE(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
+
 static const std::string EMPTY = "";
 
-static TickType_t last_run = 0;
+// Seconds since a millis() timestamp, -1 if the event never happened.
+static int age_s(uint32_t now, uint32_t then) {
+  return then == 0 ? -1 : (int) ((now - then) / 1000);
+}
+
+// HCI error / disconnect reasons that matter for this remote.
+static const char *hci_reason_name(uint8_t r) {
+  switch (r) {
+    case 0x08: return "connection timeout (link lost / supervision timeout)";
+    case 0x13: return "remote user terminated (the remote hung up)";
+    case 0x14: return "remote low resources";
+    case 0x15: return "remote power off";
+    case 0x16: return "local host terminated (we hung up)";
+    case 0x22: return "LMP/LL response timeout";
+    case 0x28: return "instant passed";
+    case 0x3B: return "unacceptable connection parameters";
+    case 0x3D: return "MIC failure (bad / missing encryption key)";
+    case 0x3E: return "failed to establish connection";
+    default:   return "other";
+  }
+}
 
 // Maximum connection latency we will accept/request.
 // With max_int=16 (20 ms × 1.25), effective wake interval =
@@ -40,28 +68,45 @@ static const char *hid_state_name(HIDState s) {
   }
 }
 
+void RemodoX::log_stats_() {
+  uint32_t now = millis();
+  LOGI("[stats] hid=%s link=%d up=%ds notifies=%u keys=%u last_notify=%ds last_key=%ds "
+       "keepalives=%u connections=%u heap=%u",
+       hid_state_name(this->hid_state), (int) this->parent()->state(),
+       this->hid_state == HIDState::INIT ? -1 : age_s(now, this->connect_ms_),
+       (unsigned) this->notify_count_, (unsigned) this->key_count_,
+       age_s(now, this->last_notify_ms_), age_s(now, this->last_key_ms_),
+       (unsigned) this->keepalive_count_, (unsigned) this->connection_count_,
+       (unsigned) esp_get_free_heap_size());
+}
+
 void RemodoX::loop() {
+  uint32_t stats_now = millis();
+  if (stats_now - this->last_stats_ms_ >= STATS_INTERVAL_MS) {
+    this->last_stats_ms_ = stats_now;
+    this->log_stats_();
+  }
   switch (this->hid_state) {
     case HIDState::BLE_CONNECTED:
       // Set READING_CHARS first so the fast-path inside read_client_characteristics()
       // can immediately override it to READ_CHARS (reconnect with cached report map).
       this->hid_state = HIDState::READING_CHARS;
       this->read_client_characteristics();
-      ESP_LOGI(TAG, "[state] BLE_CONNECTED → %s", hid_state_name(this->hid_state));
+      LOGI("[state] BLE_CONNECTED → %s", hid_state_name(this->hid_state));
       break;
     case HIDState::READ_CHARS:
-      ESP_LOGD(TAG, "[state] READ_CHARS → configuring HID client");
+      LOGD("[state] READ_CHARS → configuring HID client");
       this->configure_hid_client();
       // Advance to NOTIFICATIONS_REGISTERING.  If no notify handles were found
       // (or all register_for_notify calls failed), the counter is already 0 and
       // no REG_FOR_NOTIFY_EVT will ever fire — advance directly to
       // NOTIFICATIONS_REGISTERED to avoid a permanent deadlock.
       if (this->handles_waiting_for_notify_registration == 0) {
-        ESP_LOGW(TAG, "[state] no notify registrations pending after configure "
+        LOGW("[state] no notify registrations pending after configure "
                  "— advancing directly to NOTIFICATIONS_REGISTERED");
         this->hid_state = HIDState::NOTIFICATIONS_REGISTERED;
       } else {
-        ESP_LOGD(TAG, "[state] NOTIFICATIONS_REGISTERING: "
+        LOGD("[state] NOTIFICATIONS_REGISTERING: "
                  "waiting for %d REG_FOR_NOTIFY_EVT callbacks",
                  this->handles_waiting_for_notify_registration);
         this->hid_state = HIDState::NOTIFICATIONS_REGISTERING;
@@ -82,18 +127,18 @@ void RemodoX::loop() {
         // WiFi burst can cause consecutive BLE events to be missed.
         if (p.timeout < 800) p.timeout = 800;
         if (p.latency > MAX_CONN_LATENCY) p.latency = MAX_CONN_LATENCY;
-        ESP_LOGI(TAG, "[state] NOTIFICATIONS_REGISTERED → CONFIGURED: "
+        LOGI("[state] NOTIFICATIONS_REGISTERED → CONFIGURED: "
                  "requesting conn params interval=%u-%u latency=%u timeout=%u",
                  p.min_int, p.max_int, p.latency, p.timeout);
         esp_ble_gap_update_conn_params(&p);
       } else {
-        ESP_LOGD(TAG, "[state] NOTIFICATIONS_REGISTERED → CONFIGURED: "
+        LOGD("[state] NOTIFICATIONS_REGISTERED → CONFIGURED: "
                  "no preferred conn params, keeping current");
       }
       this->hid_state = HIDState::CONFIGURED;
       this->node_state = espbt::ClientState::ESTABLISHED;
       this->last_keepalive_ms_ = millis();
-      ESP_LOGI(TAG, "[state] CONFIGURED — device ready. "
+      LOGI("[state] CONFIGURED — device ready. "
                "hid_cp=0x%04X  preferred_latency=%u",
                this->hid_control_point_handle_,
                this->preferred_conn_params.latency);
@@ -123,13 +168,16 @@ void RemodoX::loop() {
         this->last_keepalive_ms_ = now;
         // Alert Level 0 = "no alert": no visible effect in Control Mode, but it reaches
         // the remote's GATT callback, which restarts its 5 min idle timer.
+        this->keepalive_count_++;
+        LOGI("[keepalive] #%u, connected %d s, last key %d s ago", (unsigned) this->keepalive_count_,
+             age_s(now, this->connect_ms_), age_s(now, this->last_key_ms_));
         if (this->ias_alert_level_handle_ != 0) {
           this->write_alert_level_(0, "keepalive");
         }
         if (this->hid_control_point_handle_ != 0) {
           // Step 1: Exit Suspend — signals host is active, resets idle timer.
           uint8_t hid_exit_suspend_cmd = 0x01;
-          ESP_LOGI(TAG, "Keepalive: writing Exit Suspend (0x01) to HID CP 0x%04X",
+          LOGI("Keepalive: writing Exit Suspend (0x01) to HID CP 0x%04X",
                    this->hid_control_point_handle_);
           esp_err_t err = esp_ble_gattc_write_char(
               this->parent()->get_gattc_if(),
@@ -139,14 +187,14 @@ void RemodoX::loop() {
               ESP_GATT_WRITE_TYPE_NO_RSP,
               ESP_GATT_AUTH_REQ_NONE);
           if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Keepalive: Exit Suspend write failed (err=0x%x)", err);
+            LOGW("Keepalive: Exit Suspend write failed (err=0x%x)", err);
           }
           // Step 2: Suspend — returns device to suspend mode so the next button
           // press triggers the remote's LED feedback.  Also Write Without
           // Response, so no pending state if the connection drops between here
           // and the next keepalive.
           uint8_t hid_suspend_cmd = 0x00;
-          ESP_LOGD(TAG, "Keepalive: writing Suspend (0x00) to HID CP 0x%04X "
+          LOGD("Keepalive: writing Suspend (0x00) to HID CP 0x%04X "
                    "(restores suspend mode → LED will flash on next button press)",
                    this->hid_control_point_handle_);
           err = esp_ble_gattc_write_char(
@@ -157,7 +205,7 @@ void RemodoX::loop() {
               ESP_GATT_WRITE_TYPE_NO_RSP,
               ESP_GATT_AUTH_REQ_NONE);
           if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Keepalive: Suspend write failed (err=0x%x)", err);
+            LOGW("Keepalive: Suspend write failed (err=0x%x)", err);
           }
         } else {
           // No HID Control Point found — attempt a conn-param update to
@@ -168,11 +216,11 @@ void RemodoX::loop() {
             esp_ble_conn_update_params_t p = this->preferred_conn_params;
             if (p.timeout < 800) p.timeout = 800;
             if (p.latency > MAX_CONN_LATENCY) p.latency = MAX_CONN_LATENCY;
-            ESP_LOGW(TAG, "Keepalive: no HID CP — conn param update only "
+            LOGW("Keepalive: no HID CP — conn param update only "
                      "(idle disconnect after 5 min may still occur)");
             esp_ble_gap_update_conn_params(&p);
           } else {
-            ESP_LOGW(TAG, "Keepalive: no mechanism available — "
+            LOGW("Keepalive: no mechanism available — "
                      "idle disconnect after 5 min of inactivity is expected");
           }
         }
@@ -187,8 +235,10 @@ void RemodoX::loop() {
         this->find_ias_handle_();
         if (this->ias_alert_level_handle_ != 0) {
           this->write_alert_level_(0, "wake sleeping remote (no HID service)");
+          LOGI("[wake] sent; if the remote was asleep it resets within ~1 s, drops this "
+               "link and re-advertises as Remodo_X_* with the HID service");
         } else {
-          ESP_LOGW(TAG, "No HID and no Immediate Alert service: cannot wake the remote");
+          LOGW("No HID and no Immediate Alert service: cannot wake the remote");
         }
       }
       break;
@@ -212,7 +262,7 @@ void RemodoX::write_alert_level_(uint8_t level, const char *why) {
       this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
       this->ias_alert_level_handle_, sizeof(level), &level,
       ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
-  ESP_LOGI(TAG, "IAS Alert Level=%u (%s) handle=0x%04X -> %s", (unsigned) level, why,
+  LOGI("IAS Alert Level=%u (%s) handle=0x%04X -> %s", (unsigned) level, why,
            this->ias_alert_level_handle_, err == ESP_OK ? "sent" : "FAILED");
 }
 
@@ -230,8 +280,28 @@ void RemodoX::gap_event_handler(esp_gap_ble_cb_event_t event,
     // Validate BDA so we don't react to updates for other connected devices.
     if (memcmp(param->update_conn_params.bda, this->parent()->get_remote_bda(), 6) != 0)
       break;
-    ESP_LOGI(TAG, "Updated conn params to interval=%.2f ms, latency=%u, timeout=%.1f ms", param->update_conn_params.conn_int * 1.25f, param->update_conn_params.latency, param->update_conn_params.timeout * 10.f);
+    LOGI("[gap] conn params updated (status=%d, %d s after connect): interval=%.2f ms, latency=%u, timeout=%.1f ms",
+         (int) param->update_conn_params.status, age_s(millis(), this->connect_ms_),
+         param->update_conn_params.conn_int * 1.25f, param->update_conn_params.latency,
+         param->update_conn_params.timeout * 10.f);
      break;
+   case ESP_GAP_BLE_SEC_REQ_EVT:
+    if (memcmp(param->ble_security.ble_req.bd_addr, this->parent()->get_remote_bda(), 6) != 0)
+      break;
+    LOGI("[gap] security request from the remote (%d s after connect)", age_s(millis(), this->connect_ms_));
+    break;
+   case ESP_GAP_BLE_AUTH_CMPL_EVT:
+    if (memcmp(param->ble_security.auth_cmpl.bd_addr, this->parent()->get_remote_bda(), 6) != 0)
+      break;
+    if (param->ble_security.auth_cmpl.success) {
+      LOGI("[gap] pairing/encryption OK (%d s after connect), auth_mode=%d key_present=%d",
+           age_s(millis(), this->connect_ms_), (int) param->ble_security.auth_cmpl.auth_mode,
+           (int) param->ble_security.auth_cmpl.key_present);
+    } else {
+      LOGW("[gap] pairing/encryption FAILED, reason=0x%02X (esp_ble_auth_fail_rsn_t)",
+           (unsigned) param->ble_security.auth_cmpl.fail_reason);
+    }
+    break;
    default:
      break;
    }
@@ -247,36 +317,36 @@ void RemodoX::read_client_characteristics() {
   // crash and require a battery pull on the next reconnect.  Skipping reads on
   // reconnect eliminates this risk entirely.
   if (this->hid_report_map != nullptr) {
-    ESP_LOGI(TAG, "[setup] Reconnect: using cached report map — "
+    LOGI("[setup] Reconnect: using cached report map — "
              "skipping all GATT reads, advancing directly to READ_CHARS");
     this->hid_state = HIDState::READ_CHARS;
     return;
   }
 
-  ESP_LOGD(TAG, "[setup] First connection: scheduling GATT reads");
+  LOGD("[setup] First connection: scheduling GATT reads");
   using namespace ble_client;
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
 
   // === GATT Service Discovery Dump ===
-  ESP_LOGD(TAG, "=== GATT Services ===");
+  LOGD("=== GATT Services ===");
   struct { BLEService *svc; const char *name; } services[] = {
     {generic_access_service, "GenericAccess(0x1800)"},
     {hid_service,            "HID(0x1812)"},
   };
   for (auto &entry : services) {
     if (entry.svc == nullptr) {
-      ESP_LOGD(TAG, "  Service %s: not present", entry.name);
+      LOGD("  Service %s: not present", entry.name);
       continue;
     }
-    ESP_LOGD(TAG, "  Service %s: %d characteristics", entry.name,
+    LOGD("  Service %s: %d characteristics", entry.name,
              entry.svc->characteristics.size());
     for (auto *chr : entry.svc->characteristics) {
-      ESP_LOGD(TAG, "    Char UUID=0x%04X handle=0x%04X props=0x%02X",
+      LOGD("    Char UUID=0x%04X handle=0x%04X props=0x%02X",
                chr->uuid.get_uuid().uuid.uuid16, chr->handle, chr->properties);
       BLEDescriptor *rpt_ref = chr->get_descriptor(ESP_GATT_UUID_RPT_REF_DESCR);
       if (rpt_ref != nullptr) {
-        ESP_LOGD(TAG, "      RPT_REF_DESCR handle=0x%04X", rpt_ref->handle);
+        LOGD("      RPT_REF_DESCR handle=0x%04X", rpt_ref->handle);
       }
     }
   }
@@ -293,7 +363,7 @@ void RemodoX::read_client_characteristics() {
     BLECharacteristic *hid_report_map_char =
         hid_service->get_characteristic(ESP_GATT_UUID_HID_REPORT_MAP);
     this->schedule_read_char(hid_report_map_char, "HID_REPORT_MAP");
-    ESP_LOGD(TAG, "Found %d characteristics",
+    LOGD("Found %d characteristics",
              hid_service->characteristics.size());
     for (auto *chr : hid_service->characteristics) {
       if (chr->uuid.get_uuid().uuid.uuid16 != ESP_GATT_UUID_HID_REPORT) {
@@ -303,7 +373,7 @@ void RemodoX::read_client_characteristics() {
       bool has_notify = (chr->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0;
       BLEDescriptor *rpt_ref_desc =
           chr->get_descriptor(ESP_GATT_UUID_RPT_REF_DESCR);
-      ESP_LOGD(TAG, "  HID_REPORT char handle=0x%04X props=0x%02X notify=%s rpt_ref=%s",
+      LOGD("  HID_REPORT char handle=0x%04X props=0x%02X notify=%s rpt_ref=%s",
                chr->handle, chr->properties,
                has_notify ? "yes" : "no",
                rpt_ref_desc != nullptr ? "yes" : "no");
@@ -312,7 +382,7 @@ void RemodoX::read_client_characteristics() {
         if (esp_ble_gattc_read_char_descr(
                 this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                 rpt_ref_desc->handle, ESP_GATT_AUTH_REQ_NO_MITM) != ESP_OK) {
-          ESP_LOGW(TAG, "scheduling reading of RPT_REF_DESCR failed for handle 0x%04X.",
+          LOGW("scheduling reading of RPT_REF_DESCR failed for handle 0x%04X.",
                    chr->handle);
         }
         this->handles_to_read.insert(
@@ -328,13 +398,13 @@ void RemodoX::on_gatt_read_finished(GATTReadData *data) {
   // keepalive read that fired after fully CONFIGURED), discard the data and
   // return without touching the state machine.
   if (itr == this->handles_to_read.end()) {
-    ESP_LOGD(TAG, "on_gatt_read_finished: handle=0x%04X len=%d — "
+    LOGD("on_gatt_read_finished: handle=0x%04X len=%d — "
              "not a setup read (keepalive or unknown); discarding",
              data->handle_, data->value_len_);
     delete data;
     return;
   }
-  ESP_LOGD(TAG, "on_gatt_read_finished: handle=0x%04X len=%d — "
+  LOGD("on_gatt_read_finished: handle=0x%04X len=%d — "
            "setup read completed (%zu/%zu total)",
            data->handle_, data->value_len_,
            std::count_if(this->handles_to_read.begin(),
@@ -350,7 +420,7 @@ void RemodoX::on_gatt_read_finished(GATTReadData *data) {
       return;
     }
   }
-  ESP_LOGD(TAG, "on_gatt_read_finished: all %zu setup reads done → READ_CHARS",
+  LOGD("on_gatt_read_finished: all %zu setup reads done → READ_CHARS",
            this->handles_to_read.size());
   this->hid_state = HIDState::READ_CHARS;
 }
@@ -361,19 +431,29 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
   esp_ble_gattc_cb_param_t *p_data = param;
   switch (event) {
     case ESP_GATTC_CONNECT_EVT: {
-      ESP_LOGI(TAG, "[gattc] CONNECT_EVT: initiating encryption");
+      uint32_t now = millis();
+      this->connection_count_++;
+      LOGI("[gattc] CONNECT_EVT #%u (%d s after the last disconnect, cached report map: %s) — initiating encryption",
+           (unsigned) this->connection_count_, age_s(now, this->disconnect_ms_),
+           this->hid_report_map != nullptr ? "yes" : "no");
+      this->connect_ms_ = now;
+      this->notify_count_ = 0;
+      this->key_count_ = 0;
+      this->keepalive_count_ = 0;
+      this->last_notify_ms_ = 0;
+      this->last_key_ms_ = 0;
       auto ret = esp_ble_set_encryption(param->connect.remote_bda,
                                         ESP_BLE_SEC_ENCRYPT);
       if (ret) {
-        ESP_LOGE(TAG, "[gattc] esp_ble_set_encryption error, status=%d", ret);
+        LOGE("[gattc] esp_ble_set_encryption error, status=%d", ret);
       }
       esp_gap_conn_params_t params;
       ret = esp_ble_get_current_conn_params(
           this->parent()->get_remote_bda(), &params);
       if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "[gattc] CONNECT_EVT: could not read current conn params");
+        LOGW("[gattc] CONNECT_EVT: could not read current conn params");
       } else {
-        ESP_LOGI(TAG, "[gattc] CONNECT_EVT: initial conn params "
+        LOGI("[gattc] CONNECT_EVT: initial conn params "
                  "interval=%u (%.1f ms) latency=%u timeout=%u (%.1f ms)",
                  params.interval, params.interval * 1.25f,
                  params.latency, params.timeout, params.timeout * 10.0f);
@@ -381,9 +461,20 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
       break;
     }
     case ESP_GATTC_DISCONNECT_EVT: {
-      ESP_LOGW(TAG, "[gattc] DISCONNECT_EVT: [%s] reason=0x%02X — resetting HID state",
-               this->parent()->address_str(),
-               param->disconnect.reason);
+      {
+        uint32_t now = millis();
+        int idle_s = age_s(now, this->last_key_ms_ != 0 ? this->last_key_ms_ : this->connect_ms_);
+        LOGW("[gattc] DISCONNECT_EVT: reason=0x%02X (%s) — connected %d s, %u notifies, %u keys, "
+             "last key %d s ago, state=%s",
+             (unsigned) param->disconnect.reason, hci_reason_name(param->disconnect.reason),
+             age_s(now, this->connect_ms_), (unsigned) this->notify_count_, (unsigned) this->key_count_,
+             age_s(now, this->last_key_ms_), hid_state_name(this->hid_state));
+        if (param->disconnect.reason == 0x13 && idle_s >= 290) {
+          LOGW("[gattc] ... %d s without a key: looks like the remote's 5 min idle timeout, "
+               "it now resets and sleeps (no HID service, advertises Find_Remodo_X_*)", idle_s);
+        }
+        this->disconnect_ms_ = now;
+      }
       this->status_set_warning("Disconnected");
       // Reset all HID state so reconnection starts cleanly.
       HIDState prev = this->hid_state;
@@ -408,11 +499,11 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
       // The report map and handle mappings are static properties of the device
       // and never change, so caching them is correct.
       if (this->hid_report_map != nullptr) {
-        ESP_LOGI(TAG, "[gattc] DISCONNECT_EVT: keeping cached report map + "
+        LOGI("[gattc] DISCONNECT_EVT: keeping cached report map + "
                  "%zu handle→report_id mappings for reconnect (no GATT reads on reconnect)",
                  this->handle_report_id.size());
       }
-      ESP_LOGD(TAG, "[gattc] DISCONNECT_EVT: was in state=%s, reset to INIT",
+      LOGD("[gattc] DISCONNECT_EVT: was in state=%s, reset to INIT",
                hid_state_name(prev));
       break;
     }
@@ -420,32 +511,31 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
       if (p_data->search_res.srvc_id.uuid.uuid.uuid16 ==
           ESP_GATT_UUID_HID_SVC) {
         this->hid_state = HIDState::HID_SERVICE_FOUND;
-        ESP_LOGD(TAG, "[gattc] SEARCH_RES_EVT: HID service found on %s",
-                 this->parent()->address_str());
+        LOGI("[gattc] SEARCH_RES_EVT: HID service (0x1812) found");
       } else {
-        ESP_LOGD(TAG, "[gattc] SEARCH_RES_EVT: service UUID=0x%04X",
+        LOGI("[gattc] SEARCH_RES_EVT: service UUID=0x%04X",
                  p_data->search_res.srvc_id.uuid.uuid.uuid16);
       }
       break;
     }
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       if (this->hid_state != HIDState::HID_SERVICE_FOUND) {
-        ESP_LOGW(TAG, "[gattc] SEARCH_CMPL_EVT: no HID service on %s — aborting",
-                 this->parent()->address_str());
+        LOGW("[gattc] SEARCH_CMPL_EVT: no HID service (%d s after connect) — the remote is "
+             "asleep or in Setup Mode", age_s(millis(), this->connect_ms_));
         this->hid_state = HIDState::NO_HID_SERVICE;
         this->status_set_warning("Invalid device config");
         break;
       }
-      ESP_LOGD(TAG, "[gattc] SEARCH_CMPL_EVT: status=%d → BLE_CONNECTED",
+      LOGD("[gattc] SEARCH_CMPL_EVT: status=%d → BLE_CONNECTED",
                p_data->search_cmpl.status);
       this->hid_state = HIDState::BLE_CONNECTED;
       esp_gap_conn_params_t params;
       esp_err_t ret = esp_ble_get_current_conn_params(
           this->parent()->get_remote_bda(), &params);
       if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "[gattc] SEARCH_CMPL_EVT: could not read current conn params");
+        LOGW("[gattc] SEARCH_CMPL_EVT: could not read current conn params");
       } else {
-        ESP_LOGI(TAG, "[gattc] SEARCH_CMPL_EVT: conn params after service discovery "
+        LOGI("[gattc] SEARCH_CMPL_EVT: conn params after service discovery "
                  "interval=%u (%.1f ms) latency=%u timeout=%u (%.1f ms)",
                  params.interval, params.interval * 1.25f,
                  params.latency, params.timeout, params.timeout * 10.0f);
@@ -456,7 +546,7 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
     case ESP_GATTC_READ_DESCR_EVT: {
       if (param->read.conn_id != this->parent()->get_conn_id()) break;
       if (param->read.status != ESP_OK) {
-        ESP_LOGW(TAG, "[gattc] READ_%s_EVT: handle=0x%04X FAILED status=0x%02X",
+        LOGW("[gattc] READ_%s_EVT: handle=0x%04X FAILED status=0x%02X",
                  event == ESP_GATTC_READ_CHAR_EVT ? "CHAR" : "DESCR",
                  param->read.handle, param->read.status);
         // If this was a pending setup read, erase it from the map so the state
@@ -473,14 +563,14 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
             if (kv.second == nullptr) { any_pending = true; break; }
           }
           if (!any_pending) {
-            ESP_LOGW(TAG, "[gattc] READ_EVT: all setup reads accounted for "
+            LOGW("[gattc] READ_EVT: all setup reads accounted for "
                      "(some failed) → READ_CHARS");
             this->hid_state = HIDState::READ_CHARS;
           }
         }
         break;
       }
-      ESP_LOGD(TAG, "[gattc] READ_%s_EVT: handle=0x%04X len=%d OK",
+      LOGD("[gattc] READ_%s_EVT: handle=0x%04X len=%d OK",
                event == ESP_GATTC_READ_CHAR_EVT ? "CHAR" : "DESCR",
                param->read.handle, param->read.value_len);
       GATTReadData *data = new GATTReadData(
@@ -491,46 +581,59 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
     case ESP_GATTC_WRITE_CHAR_EVT: {
       if (param->write.conn_id != this->parent()->get_conn_id()) break;
       if (param->write.status != ESP_GATT_OK) {
-        ESP_LOGW(TAG, "[gattc] WRITE_CHAR_EVT: handle=0x%04X FAILED status=0x%02X",
+        LOGW("[gattc] WRITE_CHAR_EVT: handle=0x%04X FAILED status=0x%02X",
                  param->write.handle, param->write.status);
       } else {
-        ESP_LOGD(TAG, "[gattc] WRITE_CHAR_EVT: handle=0x%04X OK",
+        LOGD("[gattc] WRITE_CHAR_EVT: handle=0x%04X OK",
                  param->write.handle);
       }
       break;
     }
+    case ESP_GATTC_WRITE_DESCR_EVT: {
+      if (param->write.conn_id != this->parent()->get_conn_id()) break;
+      LOGI("[gattc] WRITE_DESCR_EVT (CCCD): handle=0x%04X status=0x%02X %s",
+           param->write.handle, (unsigned) param->write.status,
+           param->write.status == ESP_GATT_OK ? "OK, notifications enabled" : "FAILED, key presses will be ignored by the remote");
+      break;
+    }
     case ESP_GATTC_NOTIFY_EVT: {
       if (param->notify.conn_id != this->parent()->get_conn_id()) break;
-      ESP_LOGD(TAG, "[gattc] NOTIFY_EVT: handle=0x%04X len=%d state=%s",
-               p_data->notify.handle, p_data->notify.value_len,
-               hid_state_name(this->hid_state));
+      {
+        uint32_t now = millis();
+        this->notify_count_++;
+        LOGI("[notify] #%u handle=0x%04X len=%d state=%s (%d s since the previous notify, %d s after connect)",
+             (unsigned) this->notify_count_, p_data->notify.handle, p_data->notify.value_len,
+             hid_state_name(this->hid_state), age_s(now, this->last_notify_ms_),
+             age_s(now, this->connect_ms_));
+        this->last_notify_ms_ = now;
+      }
       this->send_input_report_event(p_data);
       break;
     }
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
       if (param->reg_for_notify.status != ESP_GATT_OK) {
-        ESP_LOGW(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X FAILED status=0x%02X",
+        LOGW("[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X FAILED status=0x%02X",
                  param->reg_for_notify.handle, param->reg_for_notify.status);
       } else {
-        ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X OK",
+        LOGD("[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X OK",
                  param->reg_for_notify.handle);
       }
       // Guard against uint8_t underflow caused by stale callbacks firing after
       // a disconnect (when the counter has already been reset to 0).
       if (this->handles_waiting_for_notify_registration == 0) {
-        ESP_LOGW(TAG, "[gattc] REG_FOR_NOTIFY_EVT: spurious event "
+        LOGW("[gattc] REG_FOR_NOTIFY_EVT: spurious event "
                  "(counter already 0, state=%s) — ignoring",
                  hid_state_name(this->hid_state));
         break;
       }
       this->handles_waiting_for_notify_registration--;
-      ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X remaining=%d",
+      LOGD("[gattc] REG_FOR_NOTIFY_EVT: handle=0x%04X remaining=%d",
                param->reg_for_notify.handle,
                this->handles_waiting_for_notify_registration);
       // Only advance to NOTIFICATIONS_REGISTERED from the correct state.
       if (this->handles_waiting_for_notify_registration == 0 &&
           this->hid_state == HIDState::NOTIFICATIONS_REGISTERING) {
-        ESP_LOGD(TAG, "[gattc] REG_FOR_NOTIFY_EVT: all notifications registered → "
+        LOGD("[gattc] REG_FOR_NOTIFY_EVT: all notifications registered → "
                  "NOTIFICATIONS_REGISTERED");
         this->hid_state = HIDState::NOTIFICATIONS_REGISTERED;
       }
@@ -543,12 +646,12 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
 }
 
 void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
-  ESP_LOGD(TAG, "[report] notify arrived: handle=0x%04X len=%d state=%s",
+  LOGD("[report] notify arrived: handle=0x%04X len=%d state=%s",
            p_data->notify.handle, p_data->notify.value_len,
            hid_state_name(this->hid_state));
 
   if (this->hid_report_map == nullptr) {
-    ESP_LOGW(TAG, "[report] report map not ready (state=%s) — dropping notify "
+    LOGW("[report] report map not ready (state=%s) — dropping notify "
              "handle=0x%04X len=%d",
              hid_state_name(this->hid_state),
              p_data->notify.handle, p_data->notify.value_len);
@@ -558,10 +661,10 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
   uint8_t report_id = 0;
   if (this->handle_report_id.count(p_data->notify.handle) > 0) {
     report_id = this->handle_report_id.at(p_data->notify.handle);
-    ESP_LOGD(TAG, "[report] handle=0x%04X → report_id=%d",
+    LOGD("[report] handle=0x%04X → report_id=%d",
              p_data->notify.handle, report_id);
   } else {
-    ESP_LOGW(TAG, "[report] no report_id mapping for handle=0x%04X "
+    LOGW("[report] no report_id mapping for handle=0x%04X "
              "(known mappings: %zu) — defaulting to 0",
              p_data->notify.handle, this->handle_report_id.size());
   }
@@ -575,7 +678,7 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
       snprintf(byte_str, sizeof(byte_str), "%02X ", p_data->notify.value[i]);
       hex += byte_str;
     }
-    ESP_LOGD(TAG, "[report] raw: handle=0x%04X report_id=%d len=%d data=[%s]",
+    LOGD("[report] raw: handle=0x%04X report_id=%d len=%d data=[%s]",
              p_data->notify.handle, report_id,
              p_data->notify.value_len, hex.c_str());
   }
@@ -586,32 +689,40 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
   std::vector<HIDReportItemValue> hid_report_values =
       this->hid_report_map->parse(data);
   if (hid_report_values.size() == 0) {
-    ESP_LOGD(TAG, "[report] parser returned 0 values for report_id=%d "
+    LOGD("[report] parser returned 0 values for report_id=%d "
              "(all-zeros / no change report)", report_id);
     delete[] data;
     return;
   }
-  ESP_LOGD(TAG, "[report] parser returned %zu value(s) for report_id=%d",
+  LOGD("[report] parser returned %zu value(s) for report_id=%d",
            hid_report_values.size(), report_id);
   for (HIDReportItemValue value : hid_report_values) {
     std::string usage;
     if (USAGE_PAGES.count(value.usage.page) > 0 &&
         USAGE_PAGES.at(value.usage.page).usages_.count(value.usage.usage) > 0) {
       usage = USAGE_PAGES.at(value.usage.page).usages_.at(value.usage.usage);
-      ESP_LOGD(TAG, "[report] HID event: page=0x%02X usage=0x%04X value=%d name='%s'",
+      LOGD("[report] HID event: page=0x%02X usage=0x%04X value=%d name='%s'",
                value.usage.page, value.usage.usage, (int) value.value, usage.c_str());
     } else {
       usage = std::to_string(value.usage.page) + "_" +
               std::to_string(value.usage.usage);
-      ESP_LOGD(TAG, "[report] HID event: page=0x%02X usage=0x%04X value=%d "
+      LOGD("[report] HID event: page=0x%02X usage=0x%04X value=%d "
                "(no name, fallback='%s')",
                value.usage.page, value.usage.usage, (int) value.value, usage.c_str());
     }
-    ESP_LOGI(TAG, "[report] >>> usage='%s' page=0x%02X usage_id=0x%04X value=%d",
-             usage.c_str(), value.usage.page, value.usage.usage, (int) value.value);
+    {
+      uint32_t now = millis();
+      this->key_count_++;
+      LOGI("[report] >>> KEY #%u usage='%s' code=%u_%u value=%d (%d s after connect, %d s since the previous key)",
+           (unsigned) this->key_count_, usage.c_str(), (unsigned) value.usage.page,
+           (unsigned) value.usage.usage, (int) value.value, age_s(now, this->connect_ms_),
+           age_s(now, this->last_key_ms_));
+      this->last_key_ms_ = now;
+    }
     #ifdef USE_API_HOMEASSISTANT_SERVICES
     this->fire_homeassistant_event("esphome.hid_events",
-        {{"usage", usage}, {"value", std::to_string(value.value)}});
+        {{"usage", usage}, {"value", std::to_string(value.value)},
+         {"address", this->parent()->address_str()}});
     #endif
     // Publish value first: on_value of the code sensor reads last_event_value.state,
     // which must already belong to this event.
@@ -649,7 +760,7 @@ void RemodoX::register_last_event_code_text_sensor(
 void RemodoX::schedule_read_char(
     ble_client::BLECharacteristic *characteristic, const char *name) {
   if (characteristic == nullptr) {
-    ESP_LOGW(TAG, "Characteristic '%s': not found on device (nullptr)", name);
+    LOGW("Characteristic '%s': not found on device (nullptr)", name);
     return;
   }
   if ((characteristic->properties & ESP_GATT_CHAR_PROP_BIT_READ) == 0) {
@@ -662,7 +773,7 @@ void RemodoX::schedule_read_char(
   if (esp_ble_gattc_read_char(
           this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
           characteristic->handle, ESP_GATT_AUTH_REQ_NO_MITM) != ESP_OK) {
-    ESP_LOGW(TAG, "read_char failed for '%s' (handle=0x%04X)",
+    LOGW("read_char failed for '%s' (handle=0x%04X)",
              name, characteristic->handle);
   }
   this->handles_to_read.insert(
@@ -674,7 +785,7 @@ uint8_t *RemodoX::parse_characteristic_data(
   using namespace ble_client;
   BLECharacteristic *characteristic = service->get_characteristic(uuid);
   if (characteristic == nullptr) {
-    ESP_LOGD(TAG, "No characteristic with uuid %#X found on device", uuid);
+    LOGD("No characteristic with uuid %#X found on device", uuid);
     return nullptr;
   }
   if (handles_to_read.count(characteristic->handle) >= 1 &&
@@ -695,7 +806,7 @@ uint8_t *RemodoX::parse_characteristic_data(
 
 void RemodoX::configure_hid_client() {
   using namespace ble_client;
-  ESP_LOGD(TAG, "[configure] configure_hid_client() start");
+  LOGD("[configure] configure_hid_client() start");
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
   int notify_chars = 0;  // count of notify-capable HID_REPORT handles found
@@ -706,7 +817,7 @@ void RemodoX::configure_hid_client() {
     if (hid_report_map_char != nullptr &&
         this->handles_to_read.count(hid_report_map_char->handle) > 0 &&
         this->handles_to_read.at(hid_report_map_char->handle) != nullptr) {
-      ESP_LOGD(TAG, "[configure] parsing HID Report Map");
+      LOGD("[configure] parsing HID Report Map");
       HIDReportMap::esp_logd_report_map(
           this->handles_to_read.at(hid_report_map_char->handle)->value_,
           this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
@@ -714,16 +825,16 @@ void RemodoX::configure_hid_client() {
       this->hid_report_map = HIDReportMap::parse_report_map_data(
           this->handles_to_read.at(hid_report_map_char->handle)->value_,
           this->handles_to_read.at(hid_report_map_char->handle)->value_len_);
-      ESP_LOGD(TAG, "[configure] HID Report Map parsed OK");
+      LOGD("[configure] HID Report Map parsed OK");
     } else if (this->hid_report_map != nullptr) {
       // Reconnect: report map cached from previous connection — no GATT read needed.
-      ESP_LOGI(TAG, "[configure] Using cached HID report map (reconnect)");
+      LOGI("[configure] Using cached HID report map (reconnect)");
     } else {
-      ESP_LOGW(TAG, "[configure] HID_REPORT_MAP not available and no cached map — "
+      LOGW("[configure] HID_REPORT_MAP not available and no cached map — "
                "button presses will be dropped");
     }
     std::vector<BLECharacteristic *> chars = hid_service->characteristics;
-    ESP_LOGD(TAG, "[configure] HID service has %zu characteristics", chars.size());
+    LOGD("[configure] HID service has %zu characteristics", chars.size());
     // Count notify-capable HID_REPORT chars before registering so the log shows
     // expected vs actual registrations.
     for (BLECharacteristic *c : chars) {
@@ -731,7 +842,7 @@ void RemodoX::configure_hid_client() {
           (c->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) != 0)
         notify_chars++;
     }
-    ESP_LOGI(TAG, "[configure] %d HID_REPORT notify handle(s) to register "
+    LOGI("[configure] %d HID_REPORT notify handle(s) to register "
              "(reconnect=%s — CCCDs must be re-applied per connection even "
              "when report map is cached, because CCCD values are per-connection "
              "link-layer state that resets to disabled when the peripheral disconnects)",
@@ -739,17 +850,17 @@ void RemodoX::configure_hid_client() {
     for (BLECharacteristic *hid_char : chars) {
       if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_REPORT) {
         if (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) {
-          ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: registering for notify",
+          LOGD("[configure] HID_REPORT handle=0x%04X: registering for notify",
                    hid_char->handle);
           auto status = esp_ble_gattc_register_for_notify(
               this->parent()->get_gattc_if(), this->parent()->get_remote_bda(),
               hid_char->handle);
           if (status != ESP_OK) {
-            ESP_LOGW(TAG, "[configure] register for notify failed "
+            LOGW("[configure] register for notify failed "
                      "handle=0x%04X status=%d", hid_char->handle, status);
           } else {
             this->handles_waiting_for_notify_registration++;
-            ESP_LOGD(TAG, "[configure] registered for HID notify "
+            LOGD("[configure] registered for HID notify "
                      "handle=0x%04X (pending=%d)",
                      hid_char->handle,
                      this->handles_waiting_for_notify_registration);
@@ -765,16 +876,16 @@ void RemodoX::configure_hid_client() {
                                     ? this->handles_to_read.at(rpt_ref_desc->handle)->value_[1]
                                     : 0;
           handle_report_id.insert(std::make_pair(hid_char->handle, report_id));
-          ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
+          LOGD("[configure] HID_REPORT handle=0x%04X: "
                    "report_id=%d report_type=%d",
                    hid_char->handle, report_id, report_type);
         } else if (this->handle_report_id.count(hid_char->handle) > 0) {
           // Reconnect: use cached report_id mapping — no GATT descriptor read needed.
-          ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
+          LOGD("[configure] HID_REPORT handle=0x%04X: "
                    "using cached report_id=%d",
                    hid_char->handle, this->handle_report_id.at(hid_char->handle));
         } else {
-          ESP_LOGD(TAG, "[configure] HID_REPORT handle=0x%04X: "
+          LOGD("[configure] HID_REPORT handle=0x%04X: "
                    "no RPT_REF_DESCR data — report_id defaults to 0",
                    hid_char->handle);
         }
@@ -791,29 +902,29 @@ void RemodoX::configure_hid_client() {
       if (hid_char->uuid.get_uuid().uuid.uuid16 == ESP_GATT_UUID_HID_CONTROL_POINT &&
           (hid_char->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) != 0) {
         this->hid_control_point_handle_ = hid_char->handle;
-        ESP_LOGI(TAG, "[configure] HID Control Point handle=0x%04X found "
+        LOGI("[configure] HID Control Point handle=0x%04X found "
                  "(primary keepalive: Exit Suspend + Suspend cycle every %u ms)",
                  this->hid_control_point_handle_, (unsigned) KEEPALIVE_INTERVAL_MS);
         break;
       }
     }
     if (this->hid_control_point_handle_ == 0) {
-      ESP_LOGW(TAG, "[configure] HID Control Point not found — "
+      LOGW("[configure] HID Control Point not found — "
                "keepalive will fall back to conn param update (idle timeout may still occur)");
     }
   }
   this->find_ias_handle_();
   if (this->ias_alert_level_handle_ != 0) {
-    ESP_LOGI(TAG, "[configure] Immediate Alert Level handle=0x%04X (keepalive / wake)",
+    LOGI("[configure] Immediate Alert Level handle=0x%04X (keepalive / wake)",
              this->ias_alert_level_handle_);
   } else {
-    ESP_LOGW(TAG, "[configure] Immediate Alert Level not found — IAS keepalive disabled");
+    LOGW("[configure] Immediate Alert Level not found — IAS keepalive disabled");
   }
   if (this->hid_control_point_handle_ == 0 && this->ias_alert_level_handle_ == 0) {
-    ESP_LOGW(TAG, "[configure] no keepalive mechanism found — "
+    LOGW("[configure] no keepalive mechanism found — "
              "device may self-disconnect after idle timeout");
   } else {
-    ESP_LOGI(TAG, "[configure] keepalive every %u ms: IAS handle=0x%04X, HID CP handle=0x%04X",
+    LOGI("[configure] keepalive every %u ms: IAS handle=0x%04X, HID CP handle=0x%04X",
              (unsigned) KEEPALIVE_INTERVAL_MS, this->ias_alert_level_handle_,
              this->hid_control_point_handle_);
   }
@@ -826,7 +937,7 @@ void RemodoX::configure_hid_client() {
       this->preferred_conn_params.latency = t_conn_params[4] | (t_conn_params[5] << 8);
       this->preferred_conn_params.timeout = t_conn_params[6] | (t_conn_params[7] << 8);
       memcpy(this->preferred_conn_params.bda, this->parent()->get_remote_bda(), 6);
-      ESP_LOGI(TAG, "[configure] preferred conn params: "
+      LOGI("[configure] preferred conn params: "
                "interval=%.2f-%.2f ms latency=%u timeout=%.1f ms",
                preferred_conn_params.min_int * 1.25f,
                preferred_conn_params.max_int * 1.25f,
@@ -834,7 +945,7 @@ void RemodoX::configure_hid_client() {
                preferred_conn_params.timeout * 10.0f);
     }
   }
-  ESP_LOGI(TAG, "[configure] configure_hid_client() done: "
+  LOGI("[configure] configure_hid_client() done: "
            "notify_pending=%d/%d report_map=%s hid_cp=0x%04X",
            this->handles_waiting_for_notify_registration,
            notify_chars,
