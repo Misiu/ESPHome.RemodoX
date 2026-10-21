@@ -1,16 +1,37 @@
 # ESPHome.RemodoX
 
-ESPHome external component that receives key events from a **Remotec Remodo X** Bluetooth LE remote through an ESP32 and exposes them to Home Assistant.
+ESPHome external component that receives key events from a **Remotec Remodo X** Bluetooth LE remote through an ESP32 and exposes them to Home Assistant (for example to switch the garden light).
 
-Derived from [fsievers22/esphome-ble-remote](https://github.com/fsievers22/esphome-ble-remote) (generic BLE HID client). This fork is **dedicated to Remodo X**: the keepalive, wake-up and reconnect logic follows the behaviour of the Remodo X firmware (RTL8762C, `20211006`), not generic HID remotes.
+Derived from [fsievers22/esphome-ble-remote](https://github.com/fsievers22/esphome-ble-remote) (a generic BLE HID client). This version is **dedicated to Remodo X**: the keepalive, wake-up and reconnect logic follows the behaviour of the Remodo X firmware (RTL8762C, version `20211006`), not generic HID remotes.
 
-> Status: experimental. The Remodo-specific parts are based on static analysis of the firmware and have not yet been verified on hardware.
+> Status: experimental. The Remodo-specific logic comes from static analysis of the firmware and has not yet been verified over a long run on real hardware.
 
-## Requirements
-- ESP32 with the `esp-idf` framework (developed on ESP32-S3). Upstream notes that boards without PSRAM seem not to be compatible.
-- The remote's keys are programmed **once in the Remodo app** (Control Mode, platform "Windows PC", keys mapped to keyboard usages). This component only receives the events.
+## 1. Program the remote in the Remodo app (once)
+The remote must already send the right keys. The component only receives them, it does not program the remote. Use the **REMODO** app (Android / iOS), version 1.4 or newer:
 
-## Usage
+1. Put the remote in **Setup Mode**: hold **Key 3 + Key 4** until you hear a beep. The LED blinks **red**. The app can only connect in this mode.
+2. In the app add the controller. When asked for the platform choose **Windows PC** (the app says to use it for single-board computers like a Raspberry Pi, and an ESP32 is treated the same way).
+3. If the app says the firmware is outdated, run the OTA update first (needed: `20211006`).
+4. Open **Key Mapping Profiles** and create a profile. For each key choose the type **HID keys** → **Keyboard** and assign:
+
+   | Remodo X key | Single Press | Long Press |
+   |---|---|---|
+   | Key 1 | **A** | **E** |
+   | Key 2 | **B** | **F** |
+   | Key 3 | **C** | **G** |
+   | Key 4 | **D** | **H** |
+
+   (Letters are keyboard usages 4 to 11, so they arrive as `7_4` … `7_11`, exactly what `example.yaml` expects. You can use other keys, then adjust the mapping in the YAML.)
+5. Tap **Apply This Profile** so the mapping is written to the remote.
+6. Switch the remote to **Control Mode**: hold **Key 1 + Key 2** until you hear a beep. The LED blinks **green**. All HID keys work only in this mode.
+7. Make sure the remote is not paired with another computer or phone. The remote remembers the **first** device it pairs with in Control Mode. To forget it, hold **Key 1 + Key 4** until you hear a beep (and remove `Remodo_X_xxxxx` from the Bluetooth list of the other device).
+
+LED: **red** = Setup Mode, **green** = Control Mode.
+
+## 2. Flash the ESP32
+Copy [`example.yaml`](example.yaml), set the `mac_address` of your remote (the advertised name is `Remodo_X_` followed by the last five hex digits of that address) and flash it. When the remote is in Control Mode and not bonded, the ESP32 connects and pairs with it automatically. The log should show `Remodo connected` and `[configure] keepalive …`.
+
+Minimal configuration:
 ```yaml
 external_components:
   - source: github://Misiu/ESPHome.RemodoX@main
@@ -38,25 +59,25 @@ sensor:
 
 text_sensor:
   - platform: remodox
-    type: last_event_code        # "<usage page>_<usage>", e.g. "7_4" = keyboard A
+    type: last_event_code
     internal: true
 ```
-See [`example.yaml`](example.yaml). The optional `remodox_id` key on `sensor` / `text_sensor` is only needed with more than one `remodox:`.
-
 Entities:
 - `last_event_value`: `1` on press, `0` on release (when the remote reports it).
-- `last_event_code`: usage page and usage as `page_usage`.
-- `last_event_usage`: human readable usage name, e.g. `KEYBOARD_A`.
-- With the native API enabled, an `esphome.hid_events` event is also fired with `usage` and `value`.
+- `last_event_code`: usage page and usage as `page_usage`, e.g. `7_4` for keyboard **A**.
+- `last_event_usage`: readable name, e.g. `KEYBOARD_A`.
+- With the native API enabled an `esphome.hid_events` event is also fired with `usage` and `value`.
 
-## What the component does for Remodo X
-Facts below come from analysing firmware `20211006`:
+`example.yaml` turns the eight keys into one `event` entity (`button_1_press` … `button_4_long_press`) that you can use in Home Assistant automations. `remodox_id` is only needed on `sensor` / `text_sensor` when you use more than one `remodox:`.
+
+## 3. What the component does for Remodo X
+Facts from analysing firmware `20211006`:
 - The remote disconnects itself after **5 minutes without activity** (HCI reason `0x13`), resets, and wakes in a sleep mode that has **no HID service** and advertises as `Find_Remodo_X_…`. A host that stays connected to it makes the remote ignore key presses.
-- Key presses are only sent after the host has enabled notifications, and a short press is sent on key release.
-- Writing **Alert Level `0`** (Immediate Alert `0x1802` / `0x2A06`) restarts the remote's idle timer, and wakes it when it sleeps.
+- A short key press is sent when the key is **released**, and only if the host has enabled notifications at that moment. The press that wakes a sleeping remote is therefore usually lost, so the link should stay up.
+- A write of **Alert Level `0`** (Immediate Alert `0x1802` / `0x2A06`) restarts the remote's idle timer. In sleep mode it restores the previous mode and restarts the remote (wake-up without a key press).
 
 So the component:
-1. writes Alert Level `0` every 90 s while connected (keepalive, so the remote does not fall asleep),
+1. writes Alert Level `0` every 90 s while connected (keepalive, the remote does not fall asleep),
 2. writes Alert Level `0` once when it connects to a remote without a HID service (wake),
 3. additionally keeps the older HID Control Point keepalive (Exit Suspend / Suspend),
 4. raises the connection supervision timeout to at least 8 s (the remote asks for 3 s, which is fragile with WiFi coexistence).

@@ -1,3 +1,6 @@
+# Remodo X -> Home Assistant through an ESP32 (ESPHome 2026.x, esp-idf).
+# Put your Wi-Fi and OTA credentials in secrets.yaml.
+
 esphome:
   name: esphome-remodo
   friendly_name: Remodo X Proxy
@@ -9,6 +12,7 @@ esp32:
 
 logger:
 api:
+
 ota:
   - platform: esphome
     password: !secret ota_password
@@ -28,14 +32,21 @@ esp32_ble_tracker:
 
 ble_client:
   - id: remodo_ble
-    mac_address: "AA:BB:CC:DD:EE:FF"   # your Remodo X
+    mac_address: "AA:BB:CC:DD:EE:FF"   # the BD address of your Remodo X
     auto_connect: true
+    on_connect:
+      then:
+        - logger.log: "Remodo connected"
+    on_disconnect:
+      then:
+        - logger.log: "Remodo disconnected"
 
 remodox:
   id: remodo_x
   ble_client_id: remodo_ble
 
 sensor:
+  # 1 = key pressed, 0 = released (when the remote reports it)
   - platform: remodox
     type: last_event_value
     id: remodo_last_value
@@ -43,20 +54,31 @@ sensor:
     internal: true
 
 text_sensor:
-  # Keys 1-4 (short press) send keyboard A-D, long press E-H: HID page 7, usage 4..11.
   - platform: remodox
-    type: last_event_code
+    type: last_event_code            # "<usage page>_<usage id>"
     name: "Remodo Last Event Code"
     internal: true
     on_value:
       then:
-        - if:
-            condition:
-              lambda: 'return x == "7_4" && id(remodo_last_value).state == 1;'
-            then:
-              - event.trigger:
-                  id: remodo_buttons
-                  event_type: button_1_press
+        - lambda: |-
+            // The remote is programmed in the Remodo app to send keyboard keys A..H
+            // (HID usage page 7, usage ids 4..11):
+            //   short press Key 1..4 = A B C D   -> "7_4".."7_7"
+            //   long  press Key 1..4 = E F G H   -> "7_8".."7_11"
+            static const char *const EVENTS[] = {
+                "button_1_press", "button_2_press", "button_3_press", "button_4_press",
+                "button_1_long_press", "button_2_long_press", "button_3_long_press",
+                "button_4_long_press"};
+            if (id(remodo_last_value).state != 1) return;
+            if (x.compare(0, 2, "7_") != 0) return;
+            int usage = atoi(x.c_str() + 2);
+            if (usage >= 4 && usage <= 11) id(remodo_buttons).trigger(EVENTS[usage - 4]);
+
+  # Optional: readable key name, e.g. KEYBOARD_A
+  - platform: remodox
+    type: last_event_usage
+    name: "Remodo Last Event Usage"
+    internal: true
 
 event:
   - platform: template
