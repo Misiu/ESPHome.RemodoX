@@ -1,0 +1,74 @@
+esphome:
+  name: esphome-remodo
+  friendly_name: Remodo X Proxy
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+api:
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+esp32_ble:
+  io_capability: keyboard_display
+
+external_components:
+  - source: github://Misiu/ESPHome.RemodoX@main
+    components: [remodox]
+
+esp32_ble_tracker:
+
+ble_client:
+  - id: remodo_ble
+    mac_address: "AA:BB:CC:DD:EE:FF"   # your Remodo X
+    auto_connect: true
+
+remodox:
+  id: remodo_x
+  ble_client_id: remodo_ble
+
+sensor:
+  - platform: remodox
+    type: last_event_value
+    id: remodo_last_value
+    name: "Remodo Last Event Value"
+    internal: true
+
+text_sensor:
+  # Keys 1-4 (short press) send keyboard A-D, long press E-H: HID page 7, usage 4..11.
+  - platform: remodox
+    type: last_event_code
+    name: "Remodo Last Event Code"
+    internal: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "7_4" && id(remodo_last_value).state == 1;'
+            then:
+              - event.trigger:
+                  id: remodo_buttons
+                  event_type: button_1_press
+
+event:
+  - platform: template
+    id: remodo_buttons
+    name: "Remodo Buttons"
+    device_class: button
+    event_types:
+      - button_1_press
+      - button_2_press
+      - button_3_press
+      - button_4_press
+      - button_1_long_press
+      - button_2_long_press
+      - button_3_long_press
+      - button_4_long_press
