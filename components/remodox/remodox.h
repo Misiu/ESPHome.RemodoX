@@ -136,6 +136,10 @@ class RemodoX : public Component, public ble_client::BLEClientNode {
   uint32_t keepalive_count_ = 0;  // since the current connection
   uint32_t connection_count_ = 0; // since boot
   void log_stats_();
+
+  // Set when the link is up but unusable (failed encryption, CCCD not written): loop() drops it.
+  bool recover_ = false;
+  const char *recover_why_ = "";
 };
 
 }  // namespace remodox

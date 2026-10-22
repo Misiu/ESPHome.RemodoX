@@ -29,7 +29,7 @@ The remote must already send the right keys. The component only receives them, i
 LED: **red** = Setup Mode, **green** = Control Mode.
 
 ## 2. Flash the ESP32
-Copy [`example.yaml`](example.yaml), set `remodo_mac` in the `substitutions:` block at the top to the address of your remote (its advertised name is `Remodo_X_` followed by the last five hex digits of that address) and flash it. When the remote is in Control Mode and not bonded, the ESP32 connects and pairs with it automatically. The log should show `Remodo connected` and `[configure] keepalive …`.
+Copy [`example.yaml`](example.yaml), set `remodo_mac` in the `substitutions:` block at the top to the address of your remote (the remote advertises as `Remodo_X_xxxxx`, but that suffix is not the end of the address, so take the address from the ESPHome log line `Found device ...`) and flash it. When the remote is in Control Mode and not bonded, the ESP32 connects and pairs with it automatically. The log should show `Remodo connected` and `[configure] keepalive …`.
 
 Minimal configuration:
 ```yaml
@@ -93,6 +93,7 @@ So the component:
 2. writes Alert Level `0` once when it connects to a remote without a HID service (wake),
 3. additionally keeps the older HID Control Point keepalive (Exit Suspend / Suspend),
 4. raises the connection supervision timeout to at least 8 s (the remote asks for 3 s, which is fragile with WiFi coexistence).
+5. drops a "connected but dead" link: if encryption fails (stale bond, `ESP_AUTH_SMP_ENC_FAIL`) or the notification (CCCD) write is rejected, it removes the stale bond, disconnects and lets the remote pair again. Without this the link stays up, the remote believes it is connected and ignores key presses.
 
 ## Credits and licence
 Original component by [@fsievers22](https://github.com/fsievers22/esphome-ble-remote). See [`LICENSE`](LICENSE).

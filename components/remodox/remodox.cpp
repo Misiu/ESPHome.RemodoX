@@ -12,6 +12,7 @@ namespace remodox {
 static const char *const TAG = "remodox";
 
 // Every line carries the remote's address so that several remotes can be told apart.
+#define LOGV(fmt, ...) ESP_LOGV(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
 #define LOGD(fmt, ...) ESP_LOGD(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
 #define LOGI(fmt, ...) ESP_LOGI(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
 #define LOGW(fmt, ...) ESP_LOGW(TAG, "[%s] " fmt, this->parent()->address_str(), ##__VA_ARGS__)
@@ -85,6 +86,11 @@ void RemodoX::loop() {
   if (stats_now - this->last_stats_ms_ >= STATS_INTERVAL_MS) {
     this->last_stats_ms_ = stats_now;
     this->log_stats_();
+  }
+  if (this->recover_) {
+    this->recover_ = false;
+    LOGW("[recover] %s — dropping the link so that it is rebuilt from scratch", this->recover_why_);
+    this->parent()->disconnect();
   }
   switch (this->hid_state) {
     case HIDState::BLE_CONNECTED:
@@ -298,8 +304,14 @@ void RemodoX::gap_event_handler(esp_gap_ble_cb_event_t event,
            age_s(millis(), this->connect_ms_), (int) param->ble_security.auth_cmpl.auth_mode,
            (int) param->ble_security.auth_cmpl.key_present);
     } else {
-      LOGW("[gap] pairing/encryption FAILED, reason=0x%02X (esp_ble_auth_fail_rsn_t)",
-           (unsigned) param->ble_security.auth_cmpl.fail_reason);
+      LOGW("[gap] pairing/encryption FAILED, reason=%u (97 = ESP_AUTH_SMP_ENC_FAIL: the remote did not "
+           "accept our stored key)", (unsigned) param->ble_security.auth_cmpl.fail_reason);
+      // Without encryption the remote refuses the CCCD writes and never sends keys, yet the link
+      // stays up. Drop the stale key and the link; on the next connection the remote's Security
+      // Request pairs again.
+      esp_ble_remove_bond_device(this->parent()->get_remote_bda());
+      this->recover_ = true;
+      this->recover_why_ = "pairing/encryption failed, stale bond removed";
     }
     break;
    default:
@@ -437,6 +449,7 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
            (unsigned) this->connection_count_, age_s(now, this->disconnect_ms_),
            this->hid_report_map != nullptr ? "yes" : "no");
       this->connect_ms_ = now;
+      this->recover_ = false;
       this->notify_count_ = 0;
       this->key_count_ = 0;
       this->keepalive_count_ = 0;
@@ -594,6 +607,10 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
       LOGI("[gattc] WRITE_DESCR_EVT (CCCD): handle=0x%04X status=0x%02X %s",
            param->write.handle, (unsigned) param->write.status,
            param->write.status == ESP_GATT_OK ? "OK, notifications enabled" : "FAILED, key presses will be ignored by the remote");
+      if (param->write.status != ESP_GATT_OK) {
+        this->recover_ = true;
+        this->recover_why_ = "CCCD write failed (notifications not enabled)";
+      }
       break;
     }
     case ESP_GATTC_NOTIFY_EVT: {
@@ -646,7 +663,7 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
 }
 
 void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
-  LOGD("[report] notify arrived: handle=0x%04X len=%d state=%s",
+  LOGV("[report] notify arrived: handle=0x%04X len=%d state=%s",
            p_data->notify.handle, p_data->notify.value_len,
            hid_state_name(this->hid_state));
 
@@ -661,7 +678,7 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
   uint8_t report_id = 0;
   if (this->handle_report_id.count(p_data->notify.handle) > 0) {
     report_id = this->handle_report_id.at(p_data->notify.handle);
-    LOGD("[report] handle=0x%04X → report_id=%d",
+    LOGV("[report] handle=0x%04X → report_id=%d",
              p_data->notify.handle, report_id);
   } else {
     LOGW("[report] no report_id mapping for handle=0x%04X "
@@ -678,7 +695,7 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
       snprintf(byte_str, sizeof(byte_str), "%02X ", p_data->notify.value[i]);
       hex += byte_str;
     }
-    LOGD("[report] raw: handle=0x%04X report_id=%d len=%d data=[%s]",
+    LOGV("[report] raw: handle=0x%04X report_id=%d len=%d data=[%s]",
              p_data->notify.handle, report_id,
              p_data->notify.value_len, hex.c_str());
   }
@@ -689,24 +706,24 @@ void RemodoX::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
   std::vector<HIDReportItemValue> hid_report_values =
       this->hid_report_map->parse(data);
   if (hid_report_values.size() == 0) {
-    LOGD("[report] parser returned 0 values for report_id=%d "
+    LOGV("[report] parser returned 0 values for report_id=%d "
              "(all-zeros / no change report)", report_id);
     delete[] data;
     return;
   }
-  LOGD("[report] parser returned %zu value(s) for report_id=%d",
+  LOGV("[report] parser returned %zu value(s) for report_id=%d",
            hid_report_values.size(), report_id);
   for (HIDReportItemValue value : hid_report_values) {
     std::string usage;
     if (USAGE_PAGES.count(value.usage.page) > 0 &&
         USAGE_PAGES.at(value.usage.page).usages_.count(value.usage.usage) > 0) {
       usage = USAGE_PAGES.at(value.usage.page).usages_.at(value.usage.usage);
-      LOGD("[report] HID event: page=0x%02X usage=0x%04X value=%d name='%s'",
+      LOGV("[report] HID event: page=0x%02X usage=0x%04X value=%d name='%s'",
                value.usage.page, value.usage.usage, (int) value.value, usage.c_str());
     } else {
       usage = std::to_string(value.usage.page) + "_" +
               std::to_string(value.usage.usage);
-      LOGD("[report] HID event: page=0x%02X usage=0x%04X value=%d "
+      LOGV("[report] HID event: page=0x%02X usage=0x%04X value=%d "
                "(no name, fallback='%s')",
                value.usage.page, value.usage.usage, (int) value.value, usage.c_str());
     }
