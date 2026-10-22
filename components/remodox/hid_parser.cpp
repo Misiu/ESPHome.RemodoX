@@ -348,7 +348,7 @@ namespace esphome
       if (this->input_reports.count(0) == 0)
       {
         uint8_t report_id = hid_report_data[0];
-        ESP_LOGD(TAG, "Parsing HID report with report ID (%d)", report_id);
+        ESP_LOGV(TAG, "Parsing HID report with report ID (%d)", report_id);
         hid_report_data++;
         if (this->input_reports.count(report_id) == 0)
         {
@@ -357,7 +357,7 @@ namespace esphome
         }
         return this->input_reports.at(report_id)->parse(hid_report_data);
       }
-      ESP_LOGD(TAG, "Parsing HID report without report ID");
+      ESP_LOGV(TAG, "Parsing HID report without report ID");
       return this->input_reports.at(0)->parse(hid_report_data);
     }
 
@@ -426,7 +426,7 @@ namespace esphome
         if (this->last_values[i].raw_value == value)
           continue;
         values.push_back(HIDReportItemValue(this->usage_collection->get_usage(i), value, value));
-        ESP_LOGD(TAG, values.back().to_string().c_str());
+        ESP_LOGV(TAG, "%s", values.back().to_string().c_str());
 
         this->last_values[i] = values.back();
       }
@@ -449,13 +449,13 @@ namespace esphome
           if(this->last_values[i].value){
             values.push_back(HIDReportItemValue(this->last_values[i].usage, 0, value));
             last_values[i] = values.back();
-            ESP_LOGD(TAG, values.back().to_string().c_str());
+            ESP_LOGV(TAG, "%s", values.back().to_string().c_str());
           }
         } else {
           if(this->last_values[i].value == 0){
             values.push_back(HIDReportItemValue(this->usage_collection->get_usage(value), 1, value));
             last_values[i] = values.back();
-            ESP_LOGD(TAG, last_values[i].to_string().c_str());
+            ESP_LOGV(TAG, "%s", last_values[i].to_string().c_str());
           }
         }
       }
