@@ -87,9 +87,9 @@ The ESPHome dashboard only shows the log while its window is open, and the ESP i
 
 ```
 pip install aioesphomeapi
-python tools/remodo_log.py esphome-remodo.local --dir logs
+python tools/remodo_log.py esphome-remodo.local --dir logs --keep-awake
 ```
-Make sure that machine does not go to sleep during the test. The device logs a `[stats]` line every 60 s, so a silent stretch in the file means the logger (or the network) was down, not that the remote was idle.
+On Windows add `--keep-awake` so the PC does not go to sleep while the logger runs (the display may still turn off); on other systems make sure the machine stays awake. The device logs a `[stats]` line every 60 s, so a silent stretch in the file means the logger (or the network) was down, not that the remote was idle.
 
 ## What the component does for Remodo X
 Facts from analysing firmware `20211006`:
