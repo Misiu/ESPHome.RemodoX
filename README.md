@@ -82,6 +82,15 @@ Up to three remotes can run on one ESP32. Give each its own `ble_client` and its
 - every keepalive / wake write,
 - a `[stats]` line every 60 s (state, counters, seconds since the last key, free heap).
 
+## Keeping the log in a file
+The ESPHome dashboard only shows the log while its window is open, and the ESP itself has no file system. To capture a long test (for example overnight) run [`tools/remodo_log.py`](tools/remodo_log.py) on any machine that stays on. It subscribes to the device log, reconnects after reboots, OTA updates and Wi-Fi drops, and writes one file per day, every line stamped with the date and time:
+
+```
+pip install aioesphomeapi
+python tools/remodo_log.py esphome-remodo.local --dir logs
+```
+Make sure that machine does not go to sleep during the test. The device logs a `[stats]` line every 60 s, so a silent stretch in the file means the logger (or the network) was down, not that the remote was idle.
+
 ## What the component does for Remodo X
 Facts from analysing firmware `20211006`:
 - The remote disconnects itself after **5 minutes without activity** (HCI reason `0x13`), resets, and wakes in a sleep mode that has **no HID service** and advertises as `Find_Remodo_X_…`. A host that stays connected to it makes the remote ignore key presses.
