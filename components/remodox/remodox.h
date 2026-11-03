@@ -120,7 +120,15 @@ class RemodoX : public Component, public ble_client::BLEClientNode {
   // and, when the remote sleeps (mode 8, no HID service, advertises "Find_Remodo_X_*"),
   // restores the previous mode, i.e. wakes it.  Unverified on hardware: watch the log.
   uint16_t ias_alert_level_handle_ = 0;
-  bool wake_attempted_ = false;
+  // Waking a remote that sleeps without a HID service: up to WAKE_MAX_ATTEMPTS writes, WAKE_RETRY_MS apart,
+  // then the remote is released for WAKE_RELEASE_MS so that a key press can wake it.
+  static constexpr uint32_t WAKE_RETRY_MS = 6000;
+  static constexpr uint8_t WAKE_MAX_ATTEMPTS = 3;
+  static constexpr uint32_t WAKE_RELEASE_MS = 60000;
+  uint8_t wake_attempts_ = 0;
+  uint32_t last_wake_ms_ = 0;
+  bool wake_pending_ = false;  // a wake was sent; waiting for the remote to come back with HID
+  bool auth_failed_ = false;   // encryption failed on this connection
   void find_ias_handle_();
   void write_alert_level_(uint8_t level, const char *why);
 

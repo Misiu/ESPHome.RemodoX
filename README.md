@@ -91,6 +91,12 @@ python tools/remodo_log.py esphome-remodo.local --dir logs --keep-awake
 ```
 On Windows add `--keep-awake` so the PC does not go to sleep while the logger runs (the display may still turn off); on other systems make sure the machine stays awake. The device logs a `[stats]` line every 60 s, so a silent stretch in the file means the logger (or the network) was down, not that the remote was idle.
 
+### Collector on a NAS (Docker)
+For a permanent collector, run the same script in Docker, for example on a Synology (Container Manager):
+1. Create a folder such as `/volume1/docker/remodo-log` and copy [`tools/docker-compose.yml`](tools/docker-compose.yml) and [`tools/remodo_log.py`](tools/remodo_log.py) into it.
+2. In `docker-compose.yml` set the IP address of your ESP (reserve that address in the router) and your time zone.
+3. Container Manager → Project → Create → pick that folder. The `logs/` folder next to it fills with one file per day, files older than 90 days are removed, and the container restarts by itself.
+
 ## What the component does for Remodo X
 Facts from analysing firmware `20211006`:
 - The remote disconnects itself after **5 minutes without activity** (HCI reason `0x13`), resets, and wakes in a sleep mode that has **no HID service** and advertises as `Find_Remodo_X_…`. A host that stays connected to it makes the remote ignore key presses.
@@ -103,6 +109,7 @@ So the component:
 3. additionally keeps the older HID Control Point keepalive (Exit Suspend / Suspend),
 4. raises the connection supervision timeout to at least 8 s (the remote asks for 3 s, which is fragile with WiFi coexistence).
 5. drops a "connected but dead" link: if encryption fails (stale bond, `ESP_AUTH_SMP_ENC_FAIL`) or the notification (CCCD) write is rejected, it removes the stale bond, disconnects and lets the remote pair again. Without this the link stays up, the remote believes it is connected and ignores key presses.
+6. wakes a remote that sleeps without a HID service (3 attempts, then releases it for 60 s so that a key press can wake it). A failed encryption alone no longer drops the link, so a sleeping remote, which refuses pairing, can still be woken.
 
 ## Credits and licence
 Original component by [@fsievers22](https://github.com/fsievers22/esphome-ble-remote). See [`LICENSE`](LICENSE).

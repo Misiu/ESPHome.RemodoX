@@ -1,0 +1,22 @@
+# Remodo X log collector for a NAS (Synology Container Manager) or any Docker host.
+# Keeps the ESPHome log of the device in daily files, reconnecting forever (reboots, OTA, Wi-Fi drops).
+#
+# Folder layout (create it on the NAS, e.g. /volume1/docker/remodo-log; copy the two files from tools/):
+#   docker-compose.yml        this file
+#   remodo_log.py             the script from this folder
+#   logs/                     created automatically, one file per day
+#
+# Change the IP address below to your ESP (give it a fixed address in your router).
+services:
+  remodo-log:
+    image: python:3.12-slim
+    container_name: remodo-log
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Warsaw
+    volumes:
+      - ./logs:/logs
+      - ./remodo_log.py:/app/remodo_log.py:ro
+    command: >
+      sh -c "pip install --no-cache-dir aioesphomeapi &&
+             python -u /app/remodo_log.py 192.168.0.62 --dir /logs --keep-days 90"

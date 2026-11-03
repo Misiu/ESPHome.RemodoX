@@ -233,21 +233,38 @@ void RemodoX::loop() {
       }
       break;
     }
-    case HIDState::NO_HID_SERVICE:
-      // Connected to a sleeping remote (no HID service).  It ignores keys while a host
-      // is connected, so wake it once per connection with Alert Level 0.
-      if (!this->wake_attempted_) {
-        this->wake_attempted_ = true;
-        this->find_ias_handle_();
-        if (this->ias_alert_level_handle_ != 0) {
-          this->write_alert_level_(0, "wake sleeping remote (no HID service)");
-          LOGI("[wake] sent; if the remote was asleep it resets within ~1 s, drops this "
-               "link and re-advertises as Remodo_X_* with the HID service");
-        } else {
-          LOGW("No HID and no Immediate Alert service: cannot wake the remote");
-        }
+    case HIDState::NO_HID_SERVICE: {
+      // Connected to a remote without a HID service: it is asleep (or in Setup Mode).  While a
+      // host is connected it ignores keys, so wake it with Alert Level 0.  If that does not help,
+      // let go of it for a while: unconnected, a key press wakes it.
+      uint32_t t = millis();
+      if (this->wake_attempts_ != 0 && t - this->last_wake_ms_ < WAKE_RETRY_MS) break;
+      if (this->wake_attempts_ >= WAKE_MAX_ATTEMPTS) {
+        LOGW("[wake] %u attempts did not help; releasing the remote for %u s, press a key on it to wake it",
+             (unsigned) this->wake_attempts_, (unsigned) (WAKE_RELEASE_MS / 1000));
+        this->wake_pending_ = false;
+        this->parent()->set_enabled(false);
+        this->set_timeout("remodox_release", WAKE_RELEASE_MS, [this]() {
+          LOGI("[wake] connecting to the remote again");
+          this->parent()->set_enabled(true);
+        });
+        break;
+      }
+      this->wake_attempts_++;
+      this->last_wake_ms_ = t;
+      this->find_ias_handle_();
+      if (this->ias_alert_level_handle_ != 0) {
+        this->write_alert_level_(0, "wake sleeping remote (no HID service)");
+        this->wake_pending_ = true;
+        LOGI("[wake] attempt %u/%u sent; if the remote was asleep it resets within ~1 s, drops this "
+             "link and re-advertises as Remodo_X_* with the HID service",
+             (unsigned) this->wake_attempts_, (unsigned) WAKE_MAX_ATTEMPTS);
+      } else {
+        LOGW("[wake] no HID and no Immediate Alert service: cannot wake the remote");
+        this->wake_attempts_ = WAKE_MAX_ATTEMPTS;
       }
       break;
+    }
     default:
       break;
   }
@@ -306,12 +323,10 @@ void RemodoX::gap_event_handler(esp_gap_ble_cb_event_t event,
     } else {
       LOGW("[gap] pairing/encryption FAILED, reason=%u (97 = ESP_AUTH_SMP_ENC_FAIL: the remote did not "
            "accept our stored key)", (unsigned) param->ble_security.auth_cmpl.fail_reason);
-      // Without encryption the remote refuses the CCCD writes and never sends keys, yet the link
-      // stays up. Drop the stale key and the link; on the next connection the remote's Security
-      // Request pairs again.
-      esp_ble_remove_bond_device(this->parent()->get_remote_bda());
-      this->recover_ = true;
-      this->recover_why_ = "pairing/encryption failed, stale bond removed";
+      // Do not act yet: a sleeping remote (no HID service) refuses pairing, and dropping the link
+      // now would stop us from waking it. If the remote turns out to be in Control Mode, the
+      // rejected CCCD writes trigger the recovery (see WRITE_DESCR_EVT).
+      this->auth_failed_ = true;
     }
     break;
    default:
@@ -495,7 +510,8 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
       this->handles_waiting_for_notify_registration = 0;
       this->hid_control_point_handle_ = 0;
       this->ias_alert_level_handle_ = 0;
-      this->wake_attempted_ = false;
+      this->wake_attempts_ = 0;
+      this->auth_failed_ = false;
       this->last_keepalive_ms_ = 0;
       for (auto &kv : this->handles_to_read) {
         delete kv.second;
@@ -525,6 +541,10 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
           ESP_GATT_UUID_HID_SVC) {
         this->hid_state = HIDState::HID_SERVICE_FOUND;
         LOGI("[gattc] SEARCH_RES_EVT: HID service (0x1812) found");
+        if (this->wake_pending_) {
+          this->wake_pending_ = false;
+          LOGI("[wake] OK: the remote is back with the HID service");
+        }
       } else {
         LOGI("[gattc] SEARCH_RES_EVT: service UUID=0x%04X",
                  p_data->search_res.srvc_id.uuid.uuid.uuid16);
@@ -608,8 +628,12 @@ void RemodoX::gattc_event_handler(esp_gattc_cb_event_t event,
            param->write.handle, (unsigned) param->write.status,
            param->write.status == ESP_GATT_OK ? "OK, notifications enabled" : "FAILED, key presses will be ignored by the remote");
       if (param->write.status != ESP_GATT_OK) {
+        // Without encryption the remote refuses the CCCD writes and never sends keys, yet the link
+        // stays up. Drop it (and the stale key, if encryption had failed); the next connection pairs again.
+        if (this->auth_failed_) esp_ble_remove_bond_device(this->parent()->get_remote_bda());
         this->recover_ = true;
-        this->recover_why_ = "CCCD write failed (notifications not enabled)";
+        this->recover_why_ = this->auth_failed_ ? "notifications refused after failed encryption, stale bond removed"
+                                                : "CCCD write failed (notifications not enabled)";
       }
       break;
     }
