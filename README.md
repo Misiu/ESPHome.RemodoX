@@ -83,19 +83,36 @@ Up to three remotes can run on one ESP32. Give each its own `ble_client` and its
 - a `[stats]` line every 60 s (state, counters, seconds since the last key, free heap).
 
 ## Keeping the log in a file
-The ESPHome dashboard only shows the log while its window is open, and the ESP itself has no file system. To capture a long test (for example overnight) run [`tools/remodo_log.py`](tools/remodo_log.py) on any machine that stays on. It subscribes to the device log, reconnects after reboots, OTA updates and Wi-Fi drops, and writes one file per day, every line stamped with the date and time:
+The ESPHome dashboard only shows the log while its window is open, and the ESP itself has no file system. Two ways to keep a long log (for example overnight):
 
+**A. The device sends its log to a syslog server (recommended).** ESPHome has a built-in `syslog` component that pushes every log line over UDP, so nothing needs to stay connected to the device. Add to your YAML:
+```yaml
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Warsaw
+
+udp:
+  addresses: ["192.168.0.250"]   # your syslog server
+
+syslog:
+  port: 514
+  level: DEBUG
+```
+and run a ready-made syslog-ng container on the server (for example a Synology: Container Manager -> Project). Copy [`tools/syslog-ng/`](tools/syslog-ng/) to the NAS, set `PUID`/`PGID` to the account that owns the folder, and start it. The server writes `logs/<device name>/<date>.log`, one plain file per day. To test the server without the ESP, send one packet from any PC:
+```powershell
+$u=[Net.Sockets.UdpClient]::new(); $b=[Text.Encoding]::ASCII.GetBytes("<134>Nov  3 12:00:00 test-device test: hello"); $u.Send($b,$b.Length,"192.168.0.250",514)
+```
+UDP is fire-and-forget, so lines are lost while the ESP has no Wi-Fi or the server is down.
+
+**B. A collector that connects to the device** ([`tools/remodo_log.py`](tools/remodo_log.py)). It subscribes to the device log through the native API, reconnects after reboots, OTA updates and Wi-Fi drops, and writes one file per day with the date and time of arrival:
 ```
 pip install aioesphomeapi
 python tools/remodo_log.py esphome-remodo.local --dir logs --keep-awake
 ```
-On Windows add `--keep-awake` so the PC does not go to sleep while the logger runs (the display may still turn off); on other systems make sure the machine stays awake. The device logs a `[stats]` line every 60 s, so a silent stretch in the file means the logger (or the network) was down, not that the remote was idle.
+`--keep-awake` (Windows) stops the PC from sleeping while the logger runs; on other systems make sure the machine stays awake. To run it permanently on a NAS use [`tools/docker-compose.yml`](tools/docker-compose.yml) (Python container, files older than 90 days are removed).
 
-### Collector on a NAS (Docker)
-For a permanent collector, run the same script in Docker, for example on a Synology (Container Manager):
-1. Create a folder such as `/volume1/docker/remodo-log` and copy [`tools/docker-compose.yml`](tools/docker-compose.yml) and [`tools/remodo_log.py`](tools/remodo_log.py) into it.
-2. In `docker-compose.yml` set the IP address of your ESP (reserve that address in the router) and your time zone.
-3. Container Manager → Project → Create → pick that folder. The `logs/` folder next to it fills with one file per day, files older than 90 days are removed, and the container restarts by itself.
+The device logs a `[stats]` line every 60 s, so a silent stretch in a file means the logging path was down, not that the remote was idle.
 
 ## What the component does for Remodo X
 Facts from analysing firmware `20211006`:

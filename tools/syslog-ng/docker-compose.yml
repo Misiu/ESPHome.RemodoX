@@ -1,0 +1,21 @@
+# Ready-made syslog server for the ESPHome log (component `syslog`), writing plain daily files.
+# Works on a Synology (Container Manager -> Project) or any Docker host.
+#
+# Folder on the NAS (e.g. /volume1/docker/remodo-syslog):
+#   docker-compose.yml     this file
+#   config/syslog-ng.conf  the config from this folder
+#   logs/                  created automatically: logs/esphome-remodo/2026-11-03.log, one file per day
+services:
+  syslog-ng:
+    image: lscr.io/linuxserver/syslog-ng:latest
+    container_name: remodo-syslog
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Warsaw
+      PUID: "1026"   # Synology: user and group id of the account that owns the folder (see `id` over SSH)
+      PGID: "100"
+    ports:
+      - "514:5514/udp"   # the image listens unprivileged on 5514/udp; the ESP sends to 514
+    volumes:
+      - ./config:/config
+      - ./logs:/var/log/remodo
